@@ -1,65 +1,108 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.toml`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+// Worker
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		if (request.url.endsWith('/websocket')) {
+			// Expect to receive a WebSocket Upgrade request.
+			// If there is one, accept the request and return a WebSocket Response.
+			const upgradeHeader = request.headers.get('Upgrade');
+			if (!upgradeHeader || upgradeHeader !== 'websocket') {
+				return new Response('Worker expected Upgrade: websocket', {
+					status: 426,
+				});
+			}
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 */
+			if (request.method !== 'GET') {
+				return new Response('Worker expected GET method', {
+					status: 400,
+				});
+			}
+
+			// Since we are hard coding the Durable Object ID by providing the constant name 'foo',
+			// all requests to this Worker will be sent to the same Durable Object instance.
+			let id = env.WEBSOCKET_SERVER.idFromName('foo');
+			let stub = env.WEBSOCKET_SERVER.get(id);
+
+			return stub.fetch(request);
+		}
+
+		return new Response(
+			`Supported endpoints:
+/websocket: Expects a WebSocket upgrade request`,
+			{
+				status: 200,
+				headers: {
+					'Content-Type': 'text/plain',
+				},
+			}
+		);
+	},
+};
+
+// Durable Object
+export class WebSocketServer extends DurableObject {
+	// Keeps track of all WebSocket connections
+	sessions: Map<WebSocket, { [key: string]: string }>;
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.sessions = new Map();
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	async fetch(request: Request): Promise<Response> {
+		// Creates two ends of a WebSocket connection.
+		const webSocketPair = new WebSocketPair();
+		const [client, server] = Object.values(webSocketPair);
+
+		// Calling `accept()` tells the runtime that this WebSocket is to begin terminating
+		// request within the Durable Object. It has the effect of "accepting" the connection,
+		// and allowing the WebSocket to send and receive messages.
+		server.accept();
+
+		// Generate a random UUID for the session.
+		const id = crypto.randomUUID();
+		// Add the WebSocket connection to the map of active sessions.
+		this.sessions.set(server, { id });
+
+		server.addEventListener('message', (event) => {
+			this.handleWebSocketMessage(server, event.data);
+		});
+
+		// If the client closes the connection, the runtime will close the connection too.
+		server.addEventListener('close', () => {
+			this.handleConnectionClose(server);
+		});
+
+		return new Response(null, {
+			status: 101,
+			webSocket: client,
+		});
+	}
+
+	async handleWebSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+		const connection = this.sessions.get(ws)!;
+
+		// Reply back with the same message to the connection
+		ws.send(`[Durable Object] message: ${message}, from: ${connection.id}`);
+
+		// Broadcast the message to all the connections,
+		// except the one that sent the message.
+		this.sessions.forEach((k, session) => {
+			if (session !== ws) {
+				session.send(`[Durable Object] message: ${message}, from: ${connection.id}`);
+			}
+		});
+
+		// Broadcast the message to all the connections,
+		// including the one that sent the message.
+		this.sessions.forEach((k, session) => {
+			session.send(`[Durable Object] message: ${message}, from: ${connection.id}`);
+		});
+	}
+
+	async handleConnectionClose(ws: WebSocket) {
+		this.sessions.delete(ws);
+		ws.close(1000, 'Durable Object is closing WebSocket');
 	}
 }
-
-export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
-
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
-
-		return new Response(greeting);
-	},
-} satisfies ExportedHandler<Env>;
